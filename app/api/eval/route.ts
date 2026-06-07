@@ -64,10 +64,26 @@ export async function POST(request: Request) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
+      let streamOpen = true;
       const send = (event: object) => {
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify(event)}\n\n`),
-        );
+        if (!streamOpen) return;
+        try {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(event)}\n\n`),
+          );
+        } catch (err) {
+          // Client disconnected mid-stream. Mark closed so we don't keep
+          // throwing on every subsequent progress event — without this, the
+          // unhandled rejection takes down the function before updateAgent
+          // gets a chance to mark the agent as done.
+          streamOpen = false;
+          if (
+            !(err instanceof Error) ||
+            !err.message.includes("Controller is already closed")
+          ) {
+            console.error("send failed:", err);
+          }
+        }
       };
 
       send({ type: "started", agentId });
@@ -139,7 +155,14 @@ export async function POST(request: Request) {
         });
         send({ type: "error", error: msg });
       } finally {
-        controller.close();
+        if (streamOpen) {
+          try {
+            controller.close();
+          } catch {
+            // Already closed by client disconnect; nothing to do.
+          }
+          streamOpen = false;
+        }
       }
     },
   });

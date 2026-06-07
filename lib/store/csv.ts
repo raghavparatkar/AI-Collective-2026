@@ -129,7 +129,28 @@ const blobBackend: Backend = {
   },
 };
 
-const backend: Backend = useBlob ? blobBackend : fsBackend;
+const rawBackend: Backend = useBlob ? blobBackend : fsBackend;
+
+// Per-instance content cache. Blob reads can lag a put by several seconds
+// (head's strong-consistency guarantees don't extend to the CDN content), so
+// without this each chained insert* read returned the pre-write CSV and the
+// final blob ended up with only the last write's row. Within a single Fluid
+// Compute instance, the lock serializes access, so the cache is always the
+// canonical state. Across instances we still diverge — fine for demo traffic.
+const contentCache = new Map<string, string>();
+
+const backend: Backend = {
+  async read(name) {
+    if (contentCache.has(name)) return contentCache.get(name)!;
+    const text = await rawBackend.read(name);
+    contentCache.set(name, text);
+    return text;
+  },
+  async write(name, content) {
+    contentCache.set(name, content);
+    await rawBackend.write(name, content);
+  },
+};
 
 // ----- mutex -----
 

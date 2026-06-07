@@ -173,8 +173,10 @@ async function runOnePersona(
 }
 
 export interface RunPanelOptions {
-  /** Called as each persona's call resolves (success or failure). */
-  onProgress?: (outcome: PersonaEvalOutcome) => void;
+  /** Called as each persona's call resolves. Awaited so any IO (Blob writes,
+   *  SSE flushes) finishes before runEvalPanel resolves — otherwise Vercel
+   *  may kill the function with pending writes in flight. */
+  onProgress?: (outcome: PersonaEvalOutcome) => Promise<void> | void;
 }
 
 export async function runEvalPanel(
@@ -183,7 +185,17 @@ export async function runEvalPanel(
 ): Promise<PersonaEvalOutcome[]> {
   const tasks = PERSONAS.map(async (persona) => {
     const outcome = await runOnePersona(persona, docs);
-    opts.onProgress?.(outcome);
+    if (opts.onProgress) {
+      try {
+        await opts.onProgress(outcome);
+      } catch (err) {
+        // Don't let a progress-callback failure mask the eval result.
+        console.error(
+          `onProgress failed for ${persona.key}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
     return outcome;
   });
   return Promise.all(tasks);

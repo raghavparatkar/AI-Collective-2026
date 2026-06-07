@@ -1,14 +1,18 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { put, head } from "@vercel/blob";
+import { put, head, list, del } from "@vercel/blob";
 
-// Storage backends:
-//   - Local dev (no BLOB_READ_WRITE_TOKEN): ./data/*.csv on disk
-//   - Vercel / token present:               Vercel Blob (read-modify-write)
+// File-per-record storage. The filename is historical — the *export*
+// endpoint emits CSV, but on-disk / in-Blob each agent and each score is
+// its own JSON file. This avoids the read-modify-write race that a single
+// shared CSV file produces under concurrent Vercel lambdas.
 //
-// Both backends serialize per-file via an in-process mutex. Cross-instance
-// races (e.g. two concurrent Vercel lambdas updating the same CSV) are
-// possible — fine for demo traffic, not fine at scale.
+// Layout:
+//   agents/<agentId>.json                  — one Agent per file
+//   scores/<agentId>/<scoreId>.json        — one Score per file, sharded
+//
+// Local dev (no BLOB_READ_WRITE_TOKEN): mirrors the layout under ./data/.
+// Vercel (token present): same layout in the linked Blob store.
 
 export type AgentStatus = "pending" | "running" | "done" | "error";
 
@@ -37,68 +41,87 @@ export interface Score {
   createdAt: string;
 }
 
-const AGENTS_KEY = "agents.csv";
-const SCORES_KEY = "scores.csv";
 const DATA_DIR = path.join(process.cwd(), "data");
+const AGENTS_PREFIX = "agents/";
+const SCORES_PREFIX = "scores/";
 
-const AGENT_COLS = [
-  "id",
-  "submitter_name",
-  "name",
-  "model_label",
-  "cross_cultural_doc",
-  "niche_eval_doc",
-  "bias_score",
-  "consistency",
-  "status",
-  "error_message",
-  "created_at",
-  "completed_at",
-] as const;
+const agentKey = (id: string) => `${AGENTS_PREFIX}${id}.json`;
+const scoreKey = (agentId: string, scoreId: string) =>
+  `${SCORES_PREFIX}${agentId}/${scoreId}.json`;
+const scoresForAgentPrefix = (agentId: string) =>
+  `${SCORES_PREFIX}${agentId}/`;
 
-const SCORE_COLS = [
-  "id",
-  "agent_id",
-  "persona_key",
-  "score",
-  "reasoning",
-  "raw_json",
-  "created_at",
-] as const;
-
-// ----- backend selection -----
+// ----- backend -----
 
 const useBlob = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 
 interface Backend {
-  read(name: string): Promise<string>; // returns "" if missing
-  write(name: string, content: string): Promise<void>;
+  readJson<T>(key: string): Promise<T | null>;
+  writeJson(key: string, value: unknown): Promise<void>;
+  listKeys(prefix: string): Promise<string[]>;
+  remove(key: string): Promise<void>;
+}
+
+// ----- filesystem backend (local dev) -----
+
+async function walkDir(root: string, base: string): Promise<string[]> {
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+  const out: string[] = [];
+  for (const e of entries) {
+    const full = path.join(root, e.name);
+    const rel = path.posix.join(base, e.name);
+    if (e.isDirectory()) {
+      out.push(...(await walkDir(full, rel)));
+    } else if (e.isFile() && e.name.endsWith(".json")) {
+      out.push(rel);
+    }
+  }
+  return out;
 }
 
 const fsBackend: Backend = {
-  async read(name) {
-    const file = path.join(DATA_DIR, name);
+  async readJson<T>(key: string): Promise<T | null> {
+    const file = path.join(DATA_DIR, key);
     try {
-      return await fs.readFile(file, "utf8");
+      const text = await fs.readFile(file, "utf8");
+      return JSON.parse(text) as T;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw err;
     }
   },
-  async write(name, content) {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    await fs.writeFile(path.join(DATA_DIR, name), content, "utf8");
+  async writeJson(key, value) {
+    const file = path.join(DATA_DIR, key);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify(value), "utf8");
+  },
+  async listKeys(prefix) {
+    const dir = path.join(DATA_DIR, prefix);
+    return walkDir(dir, prefix.replace(/\/$/, ""));
+  },
+  async remove(key) {
+    const file = path.join(DATA_DIR, key);
+    try {
+      await fs.unlink(file);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
   },
 };
 
+// ----- vercel blob backend -----
+
 const blobBackend: Backend = {
-  async read(name) {
-    // head() is strongly consistent on pathname — unlike list(), which can lag
-    // a put by several seconds. downloadUrl + a per-request cache-buster
-    // bypasses any CDN caching of the previous version.
+  async readJson<T>(key: string): Promise<T | null> {
     let meta;
     try {
-      meta = await head(name);
+      meta = await head(key);
     } catch (err) {
       if (
         err &&
@@ -106,278 +129,110 @@ const blobBackend: Backend = {
         "status" in err &&
         (err as { status: number }).status === 404
       ) {
-        return "";
+        return null;
       }
       throw err;
     }
     const bust = `${meta.downloadUrl}${meta.downloadUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
     const res = await fetch(bust, { cache: "no-store" });
     if (!res.ok) {
-      if (res.status === 404) return "";
-      throw new Error(`blob fetch ${name} failed: ${res.status}`);
+      if (res.status === 404) return null;
+      throw new Error(`blob fetch ${key} failed: ${res.status}`);
     }
-    return await res.text();
+    return (await res.json()) as T;
   },
-  async write(name, content) {
-    await put(name, content, {
+  async writeJson(key, value) {
+    await put(key, JSON.stringify(value), {
       access: "public",
-      contentType: "text/csv; charset=utf-8",
+      contentType: "application/json; charset=utf-8",
       allowOverwrite: true,
       addRandomSuffix: false,
       cacheControlMaxAge: 0,
     });
   },
+  async listKeys(prefix) {
+    const out: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await list({ prefix, cursor, limit: 1000 });
+      for (const b of page.blobs) {
+        if (b.pathname.endsWith(".json")) out.push(b.pathname);
+      }
+      cursor = page.cursor;
+    } while (cursor);
+    return out;
+  },
+  async remove(key) {
+    try {
+      await del(key);
+    } catch (err) {
+      if (
+        err &&
+        typeof err === "object" &&
+        "status" in err &&
+        (err as { status: number }).status === 404
+      ) {
+        return;
+      }
+      throw err;
+    }
+  },
 };
 
-const rawBackend: Backend = useBlob ? blobBackend : fsBackend;
+const backend: Backend = useBlob ? blobBackend : fsBackend;
 
-// Per-instance content cache. Blob reads can lag a put by several seconds
-// (head's strong-consistency guarantees don't extend to the CDN content), so
-// without this each chained insert* read returned the pre-write CSV and the
-// final blob ended up with only the last write's row. Within a single Fluid
-// Compute instance, the lock serializes access, so the cache is always the
-// canonical state. Across instances we still diverge — fine for demo traffic.
-const contentCache = new Map<string, string>();
-
-const backend: Backend = {
-  async read(name) {
-    if (contentCache.has(name)) return contentCache.get(name)!;
-    const text = await rawBackend.read(name);
-    contentCache.set(name, text);
-    return text;
-  },
-  async write(name, content) {
-    contentCache.set(name, content);
-    await rawBackend.write(name, content);
-  },
-};
-
-// ----- mutex -----
-
-const fileLocks = new Map<string, Promise<unknown>>();
-function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const prev = (fileLocks.get(key) ?? Promise.resolve()) as Promise<unknown>;
-  const next = prev.then(fn, fn);
-  fileLocks.set(
-    key,
-    next.catch(() => undefined),
-  );
-  return next as Promise<T>;
-}
-
-// ----- CSV encode/decode -----
-
-function csvCell(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  const s = String(v);
-  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-
-function encodeRow(values: unknown[]): string {
-  return values.map(csvCell).join(",");
-}
-
-function parseCsv(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = "";
-  let inQuotes = false;
-  let i = 0;
-  while (i < text.length) {
-    const c = text[i];
-    if (inQuotes) {
-      if (c === '"') {
-        if (text[i + 1] === '"') {
-          cell += '"';
-          i += 2;
-          continue;
-        }
-        inQuotes = false;
-        i++;
-        continue;
-      }
-      cell += c;
-      i++;
-      continue;
-    }
-    if (c === '"') {
-      inQuotes = true;
-      i++;
-      continue;
-    }
-    if (c === ",") {
-      row.push(cell);
-      cell = "";
-      i++;
-      continue;
-    }
-    if (c === "\n" || c === "\r") {
-      row.push(cell);
-      cell = "";
-      if (c === "\r" && text[i + 1] === "\n") i++;
-      i++;
-      if (row.length === 1 && row[0] === "") {
-        row = [];
-        continue;
-      }
-      rows.push(row);
-      row = [];
-      continue;
-    }
-    cell += c;
-    i++;
-  }
-  if (cell.length > 0 || row.length > 0) {
-    row.push(cell);
-    if (!(row.length === 1 && row[0] === "")) rows.push(row);
-  }
-  return rows;
-}
-
-async function readRecords(
-  key: string,
-  header: readonly string[],
-): Promise<Record<string, string>[]> {
-  const text = await backend.read(key);
-  if (!text) return [];
-  const rows = parseCsv(text);
-  if (rows.length === 0) return [];
-  const [, ...data] = rows;
-  return data.map((cells) => {
-    const obj: Record<string, string> = {};
-    header.forEach((h, idx) => {
-      obj[h] = cells[idx] ?? "";
-    });
-    return obj;
-  });
-}
-
-async function writeRecords(
-  key: string,
-  header: readonly string[],
-  rows: Record<string, unknown>[],
-) {
-  const lines: string[] = [header.join(",")];
-  for (const r of rows) {
-    lines.push(encodeRow(header.map((h) => r[h])));
-  }
-  const text = lines.join("\n") + (rows.length > 0 ? "\n" : "");
-  await backend.write(key, text);
-}
-
-// ----- serializers -----
-
-function agentToRecord(a: Agent): Record<string, unknown> {
-  return {
-    id: a.id,
-    submitter_name: a.submitterName,
-    name: a.name,
-    model_label: a.modelLabel,
-    cross_cultural_doc: a.crossCulturalDoc,
-    niche_eval_doc: a.nicheEvalDoc,
-    bias_score: a.biasScore,
-    consistency: a.consistency,
-    status: a.status,
-    error_message: a.errorMessage,
-    created_at: a.createdAt,
-    completed_at: a.completedAt,
-  };
-}
-
-function recordToAgent(r: Record<string, string>): Agent {
-  return {
-    id: r.id,
-    submitterName: r.submitter_name,
-    name: r.name,
-    modelLabel: r.model_label === "" ? null : r.model_label,
-    crossCulturalDoc: r.cross_cultural_doc,
-    nicheEvalDoc: r.niche_eval_doc,
-    biasScore: r.bias_score === "" ? null : Number(r.bias_score),
-    consistency: r.consistency === "" ? null : Number(r.consistency),
-    status: (r.status as AgentStatus) || "pending",
-    errorMessage: r.error_message === "" ? null : r.error_message,
-    createdAt: r.created_at,
-    completedAt: r.completed_at === "" ? null : r.completed_at,
-  };
-}
-
-function scoreToRecord(s: Score): Record<string, unknown> {
-  return {
-    id: s.id,
-    agent_id: s.agentId,
-    persona_key: s.personaKey,
-    score: s.score,
-    reasoning: s.reasoning,
-    raw_json: s.rawJson,
-    created_at: s.createdAt,
-  };
-}
-
-function recordToScore(r: Record<string, string>): Score {
-  return {
-    id: r.id,
-    agentId: r.agent_id,
-    personaKey: r.persona_key,
-    score: Number(r.score),
-    reasoning: r.reasoning,
-    rawJson: r.raw_json,
-    createdAt: r.created_at,
-  };
-}
-
-// ----- public api -----
+// ----- agents -----
 
 export async function listAgents(): Promise<Agent[]> {
-  return withLock(AGENTS_KEY, async () => {
-    const rows = await readRecords(AGENTS_KEY, AGENT_COLS);
-    return rows.map(recordToAgent);
-  });
+  const keys = await backend.listKeys(AGENTS_PREFIX);
+  const agents = await Promise.all(
+    keys.map((k) => backend.readJson<Agent>(k)),
+  );
+  return agents.filter((a): a is Agent => a !== null);
 }
 
 export async function getAgent(id: string): Promise<Agent | null> {
-  const agents = await listAgents();
-  return agents.find((a) => a.id === id) ?? null;
+  return backend.readJson<Agent>(agentKey(id));
 }
 
 export async function insertAgent(agent: Agent): Promise<void> {
-  await withLock(AGENTS_KEY, async () => {
-    const rows = await readRecords(AGENTS_KEY, AGENT_COLS);
-    const agents = rows.map(recordToAgent);
-    agents.push(agent);
-    await writeRecords(AGENTS_KEY, AGENT_COLS, agents.map(agentToRecord));
-  });
+  await backend.writeJson(agentKey(agent.id), agent);
 }
 
 export async function updateAgent(
   id: string,
   patch: Partial<Omit<Agent, "id">>,
 ): Promise<void> {
-  await withLock(AGENTS_KEY, async () => {
-    const rows = await readRecords(AGENTS_KEY, AGENT_COLS);
-    const agents = rows.map(recordToAgent);
-    const idx = agents.findIndex((a) => a.id === id);
-    if (idx === -1) throw new Error(`agent ${id} not found`);
-    agents[idx] = { ...agents[idx], ...patch };
-    await writeRecords(AGENTS_KEY, AGENT_COLS, agents.map(agentToRecord));
-  });
+  // Only this submission touches its own agent record, so the lack of
+  // a global lock is fine — no other writer for this id.
+  const current = await backend.readJson<Agent>(agentKey(id));
+  if (!current) throw new Error(`agent ${id} not found`);
+  const merged: Agent = { ...current, ...patch };
+  await backend.writeJson(agentKey(id), merged);
 }
 
+export async function deleteAgent(id: string): Promise<void> {
+  await backend.remove(agentKey(id));
+  // Best-effort: also drop any persisted scores for this agent.
+  const scoreKeys = await backend.listKeys(scoresForAgentPrefix(id));
+  await Promise.all(scoreKeys.map((k) => backend.remove(k)));
+}
+
+// ----- scores -----
+
 export async function listScores(agentId?: string): Promise<Score[]> {
-  return withLock(SCORES_KEY, async () => {
-    const rows = await readRecords(SCORES_KEY, SCORE_COLS);
-    const all = rows.map(recordToScore);
-    return agentId ? all.filter((s) => s.agentId === agentId) : all;
-  });
+  const prefix = agentId ? scoresForAgentPrefix(agentId) : SCORES_PREFIX;
+  const keys = await backend.listKeys(prefix);
+  const scores = await Promise.all(
+    keys.map((k) => backend.readJson<Score>(k)),
+  );
+  return scores.filter((s): s is Score => s !== null);
 }
 
 export async function insertScore(score: Score): Promise<void> {
-  await withLock(SCORES_KEY, async () => {
-    const rows = await readRecords(SCORES_KEY, SCORE_COLS);
-    const scores = rows.map(recordToScore);
-    scores.push(score);
-    await writeRecords(SCORES_KEY, SCORE_COLS, scores.map(scoreToRecord));
-  });
+  // Each score has its own pathname — concurrent inserts can never
+  // collide. This is the whole point of the file-per-record design.
+  await backend.writeJson(scoreKey(score.agentId, score.id), score);
 }
 
 export const BACKEND = useBlob ? "blob" : "fs";

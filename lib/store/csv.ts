@@ -133,8 +133,14 @@ const blobBackend: Backend = {
       }
       throw err;
     }
-    const bust = `${meta.downloadUrl}${meta.downloadUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
-    const res = await fetch(bust, { cache: "no-store" });
+    // Use meta.url (not downloadUrl) — the CDN appears to keep serving
+    // stale content on downloadUrl even with a cache-buster, whereas
+    // the plain url respects no-cache once a unique query is appended.
+    const bust = `${meta.url}${meta.url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+    const res = await fetch(bust, {
+      cache: "no-store",
+      headers: { "Cache-Control": "no-cache" },
+    });
     if (!res.ok) {
       if (res.status === 404) return null;
       throw new Error(`blob fetch ${key} failed: ${res.status}`);

@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { put, list } from "@vercel/blob";
+import { put, head } from "@vercel/blob";
 
 // Storage backends:
 //   - Local dev (no BLOB_READ_WRITE_TOKEN): ./data/*.csv on disk
@@ -93,10 +93,25 @@ const fsBackend: Backend = {
 
 const blobBackend: Backend = {
   async read(name) {
-    const { blobs } = await list({ prefix: name, limit: 1 });
-    const match = blobs.find((b) => b.pathname === name);
-    if (!match) return "";
-    const res = await fetch(match.url, { cache: "no-store" });
+    // head() is strongly consistent on pathname — unlike list(), which can lag
+    // a put by several seconds. downloadUrl + a per-request cache-buster
+    // bypasses any CDN caching of the previous version.
+    let meta;
+    try {
+      meta = await head(name);
+    } catch (err) {
+      if (
+        err &&
+        typeof err === "object" &&
+        "status" in err &&
+        (err as { status: number }).status === 404
+      ) {
+        return "";
+      }
+      throw err;
+    }
+    const bust = `${meta.downloadUrl}${meta.downloadUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
+    const res = await fetch(bust, { cache: "no-store" });
     if (!res.ok) {
       if (res.status === 404) return "";
       throw new Error(`blob fetch ${name} failed: ${res.status}`);
